@@ -1,0 +1,208 @@
+---
+- name: Configure MariaDB on db server
+  hosts: db
+  become: yes
+  tasks:
+    - name: Install MariaDB server and client
+      apt:
+        name: "{{ item }}"
+        state: present
+        update_cache: yes
+      loop:
+        - mariadb-server
+        - mariadb-client
+
+    - name: Ensure MariaDB is running
+      service:
+        name: mariadb
+        state: started
+        enabled: yes
+
+    - name: Set MariaDB root password
+      mysql_user:
+        name: root
+        host: localhost
+        password: "{{ mysql_root_password }}"
+        login_user: root
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        state: present
+      vars:
+        mysql_root_password: 42900
+
+    - name: Create /root/.my.cnf for root user
+      copy:
+        content: |
+          [client]
+          user=root
+          password={{ mysql_root_password }}
+        dest: /root/.my.cnf
+        owner: root
+        group: root
+        mode: '0600'
+      vars:
+        mysql_root_password: 42900
+
+    - name: Create Gogs database
+      mysql_db:
+        name: gogs
+        state: present
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+      vars:
+        mysql_root_password: 42900
+
+    - name: Create Gogs database user
+      mysql_user:
+        name: gogs
+        password: gogspassword
+        host: '%'
+        priv: 'gogs.*:ALL'
+        state: present
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+      vars:
+        mysql_root_password: 42900
+
+    - name: Update MariaDB bind-address
+      lineinfile:
+        path: /etc/mysql/mariadb.conf.d/50-server.cnf
+        regexp: '^bind-address\s*='
+        line: 'bind-address = 0.0.0.0'
+        state: present
+      notify: Restart MariaDB
+
+  handlers:
+    - name: Restart MariaDB
+      service:
+        name: mariadb
+        state: restarted
+
+- name: Configure Gogs on app servers
+  hosts: apps
+  become: yes
+  tasks:
+    - name: Install required packages
+      apt:
+        name: "{{ item }}"
+        state: present
+        update_cache: yes
+      loop:
+        - wget
+        - tar
+
+    - name: Create git user
+      user:
+        name: git
+        state: present
+        system: yes
+        create_home: yes
+        home: /home/git
+
+    - name: Create Gogs log directory
+      file:
+        path: /var/log/gogs
+        state: directory
+        owner: git
+        group: git
+        mode: '0755'
+
+    - name: Download Gogs
+      get_url:
+        url: https://github.com/gogs/gogs/releases/download/v0.13.2/gogs_0.13.2_linux_amd64.tar.gz
+        dest: /tmp/gogs_0.13.2_linux_amd64.tar.gz
+        mode: '0644'
+
+    - name: Extract Gogs
+      unarchive:
+        src: /tmp/gogs_0.13.2_linux_amd64.tar.gz
+        dest: /tmp
+        remote_src: yes
+
+    - name: Move Gogs to /home/git
+      command: mv /tmp/gogs /home/git/gogs
+      args:
+        creates: /home/git/gogs
+
+    - name: Set Gogs directory ownership
+      file:
+        path: /home/git/gogs
+        state: directory
+        owner: git
+        group: git
+        recurse: yes
+
+    - name: Copy Gogs systemd service file
+      copy:
+        src: /home/git/gogs/scripts/systemd/gogs.service
+        dest: /etc/systemd/system/gogs.service
+        remote_src: yes
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Ensure correct ExecStart in gogs.service
+      lineinfile:
+        path: /etc/systemd/system/gogs.service
+        regexp: '^ExecStart='
+        line: 'ExecStart=/home/git/gogs/gogs web'
+        state: present
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start Gogs service
+      service:
+        name: gogs
+        enabled: yes
+        state: started
+
+- name: Configure Nginx on nginx server
+  hosts: nginx
+  become: yes
+  tasks:
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+        update_cache: yes
+
+    - name: Create Nginx configuration for Gogs
+      copy:
+        content: |
+          upstream gogs_backend {
+              ip_hash;
+              server 192.168.56.11:3000;
+              server 192.168.56.12:3000;
+          }
+
+          server {
+              listen 80;
+
+              location / {
+                  proxy_pass http://gogs_backend;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+          }
+        dest: /etc/nginx/sites-available/gogs
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Enable Gogs site
+      file:
+        src: /etc/nginx/sites-available/gogs
+        dest: /etc/nginx/sites-enabled/gogs
+        state: link
+
+    - name: Test Nginx configuration
+      command: nginx -t
+      changed_when: false
+
+    - name: Restart Nginx
+      service:
+        name: nginx
+        state: restarted
+        enabled: yes
+
